@@ -1,0 +1,1001 @@
+1.21.8
+package yt.Numpamc.frustumcullingentity.mixin;
+
+import net.minecraft.block.BlockState;
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.render.*;
+import net.minecraft.client.render.entity.LivingEntityRenderer;
+import net.minecraft.client.render.entity.state.LivingEntityRenderState;
+import net.minecraft.client.util.math.MatrixStack;
+import net.minecraft.entity.LivingEntity;
+import net.minecraft.util.hit.BlockHitResult;
+import net.minecraft.util.hit.HitResult;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Box;
+import net.minecraft.util.math.Vec3d;
+import net.minecraft.world.RaycastContext;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+import yt.Numpamc.com.NumpaMC.CacheEntry;
+
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.util.Map;
+import java.util.WeakHashMap;
+
+@Mixin(LivingEntityRenderer.class)
+public abstract class LivingEntityRendererMixin<T extends LivingEntity> {
+
+    private static final double MAX_RENDER_DISTANCE = 110.0;
+    private static final long CACHE_DURATION_MS = 250L; // ms
+
+    // Cache: entity -> (visible, lastUpdateTime)
+    private final Map<T, CacheEntry> visibilityCache = new WeakHashMap<>();
+
+    // Map state -> entity để từ render(state) có thể tra ngược entity (updateRenderState sẽ gán)
+    private final Map<LivingEntityRenderState, T> stateToEntity = new WeakHashMap<>();
+
+    /**
+     * Hook updateRenderState để có access tới LivingEntity (và cập nhật cache).
+     * Signature: updateRenderState(T livingEntity, S livingEntityRenderState, float f)
+     */
+    @Inject(method = "updateRenderState", at = @At("HEAD"))
+    private void onUpdateRenderState(T livingEntity, LivingEntityRenderState state, float tickDelta, CallbackInfo ci) {
+        if (livingEntity == null) return;
+
+        // Lưu mapping state -> entity để render(...) có thể lookup
+        @SuppressWarnings("unchecked")
+        T keyEntity = (T) livingEntity;
+        stateToEntity.put(state, keyEntity);
+
+        // Tốc độ: chỉ check distance & cache here; nếu cần raycast, làm đầy đủ
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client == null || client.gameRenderer == null || client.world == null) return;
+
+        Camera camera = client.gameRenderer.getCamera();
+        Vec3d camPos = camera.getPos();
+
+        Box entityBox = livingEntity.getBoundingBox();
+        Vec3d entityCenter = entityBox.getCenter();
+        double distSq = camPos.squaredDistanceTo(entityCenter);
+        if (distSq > MAX_RENDER_DISTANCE * MAX_RENDER_DISTANCE) {
+            visibilityCache.put(keyEntity, new CacheEntry(false, System.currentTimeMillis()));
+            return;
+        }
+
+        // Cache short-circuit
+        CacheEntry cached = visibilityCache.get(keyEntity);
+        long now = System.currentTimeMillis();
+        if (cached != null && (now - cached.lastCheck < CACHE_DURATION_MS)) {
+            // keep cached value as-is
+            return;
+        }
+
+        // Full visibility test (raycasts)
+        boolean visible = computeVisibility(client, camPos, entityBox, entityCenter, livingEntity);
+
+        visibilityCache.put(keyEntity, new CacheEntry(visible, now));
+    }
+
+    /**
+     * Hook render(state, ...) and cancel if cache says invisible.
+     * Signature in mapping: render(S livingEntityRenderState, MatrixStack matrixStack, VertexConsumerProvider vertexConsumerProvider, int i)
+     */
+    @Inject(method = "render", at = @At("HEAD"), cancellable = true)
+    private void preRender(LivingEntityRenderState state,
+                           MatrixStack matrices,
+                           VertexConsumerProvider vertexConsumers,
+                           int light,
+                           CallbackInfo ci) {
+
+        // Lookup entity from state
+        T entity = stateToEntity.get(state);
+        if (entity == null) {
+            // As fallback: try to extract via reflection (very rare)
+            entity = extractEntityFromState(state);
+            if (entity == null) return;
+        }
+
+        @SuppressWarnings("unchecked")
+        T key = (T) entity;
+        CacheEntry cached = visibilityCache.get(key);
+        long now = System.currentTimeMillis();
+        if (cached != null && (now - cached.lastCheck < CACHE_DURATION_MS)) {
+            if (!cached.visible) {
+                ci.cancel();
+            }
+            return;
+        }
+
+        // If not cached (rare, maybe updateRenderState not called), do quick check now
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client == null || client.gameRenderer == null || client.world == null) return;
+
+        Camera camera = client.gameRenderer.getCamera();
+        Vec3d camPos = camera.getPos();
+        Box box = entity.getBoundingBox();
+        Vec3d center = box.getCenter();
+        double distSq = camPos.squaredDistanceTo(center);
+        if (distSq > MAX_RENDER_DISTANCE * MAX_RENDER_DISTANCE) {
+            visibilityCache.put(key, new CacheEntry(false, now));
+            ci.cancel();
+            return;
+        }
+
+        boolean visible = computeVisibility(client, camPos, box, center, entity);
+        visibilityCache.put(key, new CacheEntry(visible, now));
+        if (!visible) ci.cancel();
+    }
+
+    // --- visibility helpers ---
+
+    private boolean computeVisibility(MinecraftClient client, Vec3d cameraPos, Box entityBox, Vec3d entityCenter, LivingEntity entity) {
+        // Sample multiple points across bounding box: center, 8 corners, mid-top, mid-bottom
+        Vec3d[] points = new Vec3d[]{
+                entityCenter,
+                // bottom corners
+                new Vec3d(entityBox.minX, entityBox.minY, entityBox.minZ),
+                new Vec3d(entityBox.maxX, entityBox.minY, entityBox.minZ),
+                new Vec3d(entityBox.minX, entityBox.minY, entityBox.maxZ),
+                new Vec3d(entityBox.maxX, entityBox.minY, entityBox.maxZ),
+                // top corners
+                new Vec3d(entityBox.minX, entityBox.maxY, entityBox.minZ),
+                new Vec3d(entityBox.maxX, entityBox.maxY, entityBox.minZ),
+                new Vec3d(entityBox.minX, entityBox.maxY, entityBox.maxZ),
+                new Vec3d(entityBox.maxX, entityBox.maxY, entityBox.maxZ),
+                // head-ish
+                new Vec3d(entityCenter.x, entityBox.maxY - 0.1, entityCenter.z)
+        };
+
+        for (Vec3d target : points) {
+            RaycastContext ctx = new RaycastContext(
+                    cameraPos,
+                    target,
+                    RaycastContext.ShapeType.OUTLINE, // OUTLINE bắt tốt các block mỏng
+                    RaycastContext.FluidHandling.NONE,
+                    client.player
+            );
+
+            HitResult result = client.world.raycast(ctx);
+
+            if (result.getType() != HitResult.Type.BLOCK) {
+                return true; // không bị che chắn
+            }
+
+            BlockPos pos = ((BlockHitResult) result).getBlockPos();
+            BlockState blockState = client.world.getBlockState(pos);
+
+            if (!isCullableBlock(client, pos, blockState)) {
+                return true; // block này không che (glass, leaves, etc.)
+            }
+        }
+
+        return false; // mọi ray đều bị block che
+    }
+
+    /**
+     * Kiểm tra block có thể che khuất (opaque, non-translucent)
+     */
+    private boolean isCullableBlock(MinecraftClient client, BlockPos pos, BlockState state) {
+        // Nếu block không phải full opaque cube → không che
+        try {
+            if (!state.isOpaqueFullCube()) {
+                return false;
+            }
+        } catch (Exception ignored) {
+            // fallback conservative: nếu không chắc, coi là không che (để tránh cull nhầm)
+            return false;
+        }
+
+        // Kiểm tra RenderLayer theo mapping 1.21.x (RenderLayers.getBlockLayer returns RenderLayer)
+        try {
+            BlockRenderLayer layer = RenderLayers.getBlockLayer(state);
+            return !(layer == BlockRenderLayer.CUTOUT
+                    || layer == BlockRenderLayer.CUTOUT_MIPPED
+                    || layer == BlockRenderLayer.TRANSLUCENT);
+
+        } catch (Exception ignored) {
+            // fallback: nếu gặp lỗi, coi như che
+            return true;
+        }
+    }
+
+    /**
+     * Nếu updateRenderState mapping khác, không có getter entity — fallback reflect (hiếm).
+     * Nhưng trong 1.21.8, state không giữ entity nên thường không tìm thấy.
+     */
+    @SuppressWarnings("unchecked")
+    private T extractEntityFromState(LivingEntityRenderState state) {
+        if (state == null) return null;
+
+        // thử getter names (thường không có)
+        String[] getterNames = new String[] { "getLivingEntity", "getEntity", "getOwner", "getRenderedEntity" };
+        for (String g : getterNames) {
+            try {
+                Method m = state.getClass().getMethod(g);
+                m.setAccessible(true);
+                Object o = m.invoke(state);
+                if (o instanceof LivingEntity) return (T) o;
+            } catch (NoSuchMethodException ignored) {
+            } catch (Exception ignored) {
+            }
+        }
+
+        // thử các field names
+        String[] fieldNames = new String[] { "livingEntity", "entity", "owner", "renderedEntity" };
+        for (String fName : fieldNames) {
+            try {
+                Field f = state.getClass().getDeclaredField(fName);
+                f.setAccessible(true);
+                Object o = f.get(state);
+                if (o instanceof LivingEntity) return (T) o;
+            } catch (NoSuchFieldException ignored) {
+            } catch (Exception ignored) {
+            }
+        }
+
+        // thử scan tất cả fields
+        try {
+            for (Field f : state.getClass().getDeclaredFields()) {
+                f.setAccessible(true);
+                Object o = f.get(state);
+                if (o instanceof LivingEntity) return (T) o;
+            }
+        } catch (Exception ignored) {}
+
+        return null;
+    }
+}
+----------------------------------------------------------------
+        package yt.Numpamc.frustumcullingentity.mixin;
+
+import net.minecraft.block.BlockState;
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.render.*;
+import net.minecraft.client.render.entity.LivingEntityRenderer;
+import net.minecraft.client.render.entity.state.LivingEntityRenderState;
+import net.minecraft.client.util.math.MatrixStack;
+import net.minecraft.entity.LivingEntity;
+import net.minecraft.util.hit.BlockHitResult;
+import net.minecraft.util.hit.HitResult;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Box;
+import net.minecraft.util.math.Vec3d;
+import net.minecraft.world.RaycastContext;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+import yt.Numpamc.com.NumpaMC.CacheEntry;
+
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.util.Map;
+import java.util.WeakHashMap;
+
+@Mixin(LivingEntityRenderer.class)
+public abstract class LivingEntityRendererMixin<T extends LivingEntity> {
+
+    private static final double MAX_RENDER_DISTANCE = 110.0;
+    private static final long CACHE_DURATION_MS = 250L; // ms
+
+    // Cache: entity -> (visible, lastUpdateTime)
+    private final Map<T, CacheEntry> visibilityCache = new WeakHashMap<>();
+
+    // Map state -> entity để từ render(state) có thể tra ngược entity (updateRenderState sẽ gán)
+    private final Map<LivingEntityRenderState, T> stateToEntity = new WeakHashMap<>();
+
+    /**
+     * Hook updateRenderState để có access tới LivingEntity (và cập nhật cache).
+     * Signature: updateRenderState(T livingEntity, S livingEntityRenderState, float f)
+     */
+    @Inject(method = "updateRenderState", at = @At("HEAD"))
+    private void onUpdateRenderState(T livingEntity, LivingEntityRenderState state, float tickDelta, CallbackInfo ci) {
+        if (livingEntity == null) return;
+
+        // Lưu mapping state -> entity để render(...) có thể lookup
+        @SuppressWarnings("unchecked")
+        T keyEntity = (T) livingEntity;
+        stateToEntity.put(state, keyEntity);
+
+        // Tốc độ: chỉ check distance & cache here; nếu cần raycast, làm đầy đủ
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client == null || client.gameRenderer == null || client.world == null) return;
+
+        Camera camera = client.gameRenderer.getCamera();
+        Vec3d camPos = camera.getPos();
+
+        Box entityBox = livingEntity.getBoundingBox();
+        Vec3d entityCenter = entityBox.getCenter();
+        double distSq = camPos.squaredDistanceTo(entityCenter);
+        if (distSq > MAX_RENDER_DISTANCE * MAX_RENDER_DISTANCE) {
+            visibilityCache.put(keyEntity, new CacheEntry(false, System.currentTimeMillis()));
+            return;
+        }
+
+        // Cache short-circuit
+        CacheEntry cached = visibilityCache.get(keyEntity);
+        long now = System.currentTimeMillis();
+        if (cached != null && (now - cached.lastCheck < CACHE_DURATION_MS)) {
+            // keep cached value as-is
+            return;
+        }
+
+        // Full visibility test (raycasts)
+        boolean visible = computeVisibility(client, camPos, entityBox, entityCenter, livingEntity);
+
+        visibilityCache.put(keyEntity, new CacheEntry(visible, now));
+    }
+
+    /**
+     * Hook render(state, ...) and cancel if cache says invisible.
+     * Signature in mapping: render(S livingEntityRenderState, MatrixStack matrixStack, VertexConsumerProvider vertexConsumerProvider, int i)
+     */
+    @Inject(method = "render", at = @At("HEAD"), cancellable = true)
+    private void preRender(LivingEntityRenderState state,
+                           MatrixStack matrices,
+                           VertexConsumerProvider vertexConsumers,
+                           int light,
+                           CallbackInfo ci) {
+
+        // Lookup entity from state
+        T entity = stateToEntity.get(state);
+        if (entity == null) {
+            // As fallback: try to extract via reflection (very rare)
+            entity = extractEntityFromState(state);
+            if (entity == null) return;
+        }
+
+        @SuppressWarnings("unchecked")
+        T key = (T) entity;
+        CacheEntry cached = visibilityCache.get(key);
+        long now = System.currentTimeMillis();
+        if (cached != null && (now - cached.lastCheck < CACHE_DURATION_MS)) {
+            if (!cached.visible) {
+                ci.cancel();
+            }
+            return;
+        }
+
+        // If not cached (rare, maybe updateRenderState not called), do quick check now
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client == null || client.gameRenderer == null || client.world == null) return;
+
+        Camera camera = client.gameRenderer.getCamera();
+        Vec3d camPos = camera.getPos();
+        Box box = entity.getBoundingBox();
+        Vec3d center = box.getCenter();
+        double distSq = camPos.squaredDistanceTo(center);
+        if (distSq > MAX_RENDER_DISTANCE * MAX_RENDER_DISTANCE) {
+            visibilityCache.put(key, new CacheEntry(false, now));
+            ci.cancel();
+            return;
+        }
+
+        boolean visible = computeVisibility(client, camPos, box, center, entity);
+        visibilityCache.put(key, new CacheEntry(visible, now));
+        if (!visible) ci.cancel();
+    }
+
+    // --- visibility helpers ---
+
+    private boolean computeVisibility(MinecraftClient client, Vec3d cameraPos, Box entityBox, Vec3d entityCenter, LivingEntity entity) {
+        // Sample multiple points across bounding box: center, 8 corners, mid-top, mid-bottom
+        Vec3d[] points = new Vec3d[]{
+                entityCenter,
+                // bottom corners
+                new Vec3d(entityBox.minX, entityBox.minY, entityBox.minZ),
+                new Vec3d(entityBox.maxX, entityBox.maxY, entityBox.maxZ),
+
+        };
+
+        for (Vec3d target : points) {
+            RaycastContext ctx = new RaycastContext(
+                    cameraPos,
+                    target,
+                    RaycastContext.ShapeType.OUTLINE, // OUTLINE bắt tốt các block mỏng
+                    RaycastContext.FluidHandling.NONE,
+                    client.player
+            );
+
+            HitResult result = client.world.raycast(ctx);
+
+            if (result.getType() != HitResult.Type.BLOCK) {
+                return true; // không bị che chắn
+            }
+
+            BlockPos pos = ((BlockHitResult) result).getBlockPos();
+            BlockState blockState = client.world.getBlockState(pos);
+
+            if (!isCullableBlock(client, pos, blockState)) {
+                return true; // block này không che (glass, leaves, etc.)
+
+            }
+        }
+
+        return false; // mọi ray đều bị block che
+    }
+
+    /**
+     * Kiểm tra block có thể che khuất (opaque, non-translucent)
+     */
+    private boolean isCullableBlock(MinecraftClient client, BlockPos pos, BlockState state) {
+        // Nếu block không phải full opaque cube → không che
+        try {
+            if (!state.isOpaqueFullCube()) {
+                return false;
+            }
+        } catch (Exception ignored) {
+            // fallback conservative: nếu không chắc, coi là không che (để tránh cull nhầm)
+            return false;
+        }
+
+        // Kiểm tra RenderLayer theo mapping 1.21.x (RenderLayers.getBlockLayer returns RenderLayer)
+        try {
+            BlockRenderLayer layer = RenderLayers.getBlockLayer(state);
+            return !(layer == BlockRenderLayer.CUTOUT
+                    || layer == BlockRenderLayer.CUTOUT_MIPPED
+                    || layer == BlockRenderLayer.TRANSLUCENT);
+
+        } catch (Exception ignored) {
+            // fallback: nếu gặp lỗi, coi như che
+            return true;
+        }
+    }
+
+    /**
+     * Nếu updateRenderState mapping khác, không có getter entity — fallback reflect (hiếm).
+     * Nhưng trong 1.21.8, state không giữ entity nên thường không tìm thấy.
+     */
+    @SuppressWarnings("unchecked")
+    private T extractEntityFromState(LivingEntityRenderState state) {
+        if (state == null) return null;
+
+        // thử getter names (thường không có)
+        String[] getterNames = new String[] { "getLivingEntity", "getEntity", "getOwner", "getRenderedEntity" };
+        for (String g : getterNames) {
+            try {
+                Method m = state.getClass().getMethod(g);
+                m.setAccessible(true);
+                Object o = m.invoke(state);
+                if (o instanceof LivingEntity) return (T) o;
+            } catch (NoSuchMethodException ignored) {
+            } catch (Exception ignored) {
+            }
+        }
+
+        // thử các field names
+        String[] fieldNames = new String[] { "livingEntity", "entity", "owner", "renderedEntity" };
+        for (String fName : fieldNames) {
+            try {
+                Field f = state.getClass().getDeclaredField(fName);
+                f.setAccessible(true);
+                Object o = f.get(state);
+                if (o instanceof LivingEntity) return (T) o;
+            } catch (NoSuchFieldException ignored) {
+            } catch (Exception ignored) {
+            }
+        }
+
+        // thử scan tất cả fields
+        try {
+            for (Field f : state.getClass().getDeclaredFields()) {
+                f.setAccessible(true);
+                Object o = f.get(state);
+                if (o instanceof LivingEntity) return (T) o;
+            }
+        } catch (Exception ignored) {}
+
+        return null;
+    }
+}
+-----------------------------------------
+/*
+package yt.Numpamc.frustumcullingentity.mixin;
+
+import net.minecraft.block.BlockState;
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.render.*;
+import net.minecraft.client.render.entity.LivingEntityRenderer;
+import net.minecraft.client.render.entity.state.LivingEntityRenderState;
+import net.minecraft.client.util.math.MatrixStack;
+import net.minecraft.entity.LivingEntity;
+import net.minecraft.util.hit.BlockHitResult;
+import net.minecraft.util.hit.HitResult;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Box;
+import net.minecraft.util.math.Vec3d;
+import net.minecraft.world.RaycastContext;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Unique;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+import yt.Numpamc.com.NumpaMC.CacheEntry;
+
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.util.Map;
+import java.util.WeakHashMap;
+
+@Mixin(LivingEntityRenderer.class)
+public abstract class LivingEntityRendererMixin<T extends LivingEntity> {
+
+    @Unique private static final double MAX_RENDER_DISTANCE = 110.0;
+    @Unique private static final long CACHE_DURATION_MS = 250L;
+    @Unique private static final int MAX_RECURSION_DEPTH = 8;
+    @Unique private static final double STEP_OUT_BLOCK = 0.1;
+    @Unique private static final double NEAR_BLOCK_DISTANCE = 100;
+
+    @Unique private final Map<T, CacheEntry> visibilityCache = new WeakHashMap<>();
+    @Unique private final Map<LivingEntityRenderState, T> stateToEntity = new WeakHashMap<>();
+
+    @Inject(method = "updateRenderState*", at = @At("HEAD"))
+    private void onUpdateRenderState(T livingEntity, LivingEntityRenderState state, float tickDelta, CallbackInfo ci) {
+        if (livingEntity == null) return;
+        stateToEntity.put(state, livingEntity);
+
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client == null || client.world == null) return;
+
+        Camera camera = client.gameRenderer.getCamera();
+        Vec3d camPos = camera.getPos();
+        Box box = livingEntity.getBoundingBox();
+        Vec3d center = box.getCenter();
+
+        double distSq = camPos.squaredDistanceTo(center);
+        if (distSq > MAX_RENDER_DISTANCE * MAX_RENDER_DISTANCE) {
+            visibilityCache.put(livingEntity, new CacheEntry(false, System.currentTimeMillis()));
+            return;
+        }
+
+        CacheEntry cached = visibilityCache.get(livingEntity);
+        long now = System.currentTimeMillis();
+        if (cached != null && (now - cached.lastCheck < CACHE_DURATION_MS)) return;
+
+        boolean visible = computeVisibility(client, camPos, box, center);
+        visibilityCache.put(livingEntity, new CacheEntry(visible, now));
+    }
+
+    @Inject(method = "render*", at = @At("HEAD"), cancellable = true)
+    private void preRender(LivingEntityRenderState state, MatrixStack matrices,
+                           VertexConsumerProvider vertexConsumers, int light, CallbackInfo ci) {
+
+        T entity = stateToEntity.get(state);
+        if (entity == null) entity = extractEntityFromState(state);
+        if (entity == null) return;
+
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client == null || client.world == null) return;
+
+        CacheEntry cached = visibilityCache.get(entity);
+        long now = System.currentTimeMillis();
+        if (cached != null && (now - cached.lastCheck < CACHE_DURATION_MS)) {
+            if (!cached.visible) ci.cancel();
+            return;
+        }
+
+        Camera camera = client.gameRenderer.getCamera();
+        Vec3d camPos = camera.getPos();
+        Box box = entity.getBoundingBox();
+        Vec3d center = box.getCenter();
+
+        double distSq = camPos.squaredDistanceTo(center);
+        if (distSq > MAX_RENDER_DISTANCE * MAX_RENDER_DISTANCE) {
+            visibilityCache.put(entity, new CacheEntry(false, now));
+            ci.cancel();
+            return;
+        }
+
+        boolean visible = computeVisibility(client, camPos, box, center);
+        visibilityCache.put(entity, new CacheEntry(visible, now));
+        if (!visible) ci.cancel();
+    }
+
+    // --- Visibility test ---
+    @Unique
+    private boolean computeVisibility(MinecraftClient client, Vec3d cameraPos, Box box, Vec3d center) {
+        Vec3d midTop = new Vec3d(center.x, box.maxY, center.z);
+        Vec3d midBottom = new Vec3d(center.x, box.minY, center.z);
+
+        Vec3d[] points = new Vec3d[]{
+                center, midTop, midBottom,
+                new Vec3d(box.minX, box.minY, box.minZ),
+                new Vec3d(box.maxX, box.maxY, box.maxZ),
+                new Vec3d(box.minX, box.maxY, box.minZ),
+                new Vec3d(box.maxX, box.minY, box.maxZ)
+        };
+
+        for (Vec3d target : points)
+            if (raycastVisible(client, cameraPos, target, 0)) return true;
+
+        return false;
+    }
+
+    // --- Main recursive raycast ---
+    @Unique
+    private boolean raycastVisible(MinecraftClient mc, Vec3d from, Vec3d to, int depth) {
+        if (depth > MAX_RECURSION_DEPTH || mc.world == null) return false;
+
+        RaycastContext ctx = new RaycastContext(
+                from, to,
+                RaycastContext.ShapeType.OUTLINE,
+                RaycastContext.FluidHandling.NONE,
+                mc.player
+        );
+
+        HitResult result = mc.world.raycast(ctx);
+        if (result == null) return true;
+        if (result.getType() != HitResult.Type.BLOCK) return true;
+
+        Vec3d hitVec;
+        BlockPos pos;
+        try {
+            BlockHitResult bhr = (BlockHitResult) result;
+            hitVec = bhr.getPos();
+            pos = bhr.getBlockPos();
+        } catch (Exception e) {
+            hitVec = result.getPos();
+            pos = new BlockPos((int) hitVec.x, (int) hitVec.y, (int) hitVec.z);
+        }
+
+        double hitDist = from.distanceTo(hitVec);
+        BlockState hitState = mc.world.getBlockState(pos);
+
+        // nếu block trong suốt → bỏ qua
+        if (!isCullableBlock(hitState)) {
+            Vec3d dir = to.subtract(from).normalize();
+            Vec3d nextStart = hitVec.add(dir.multiply(STEP_OUT_BLOCK));
+            return raycastVisible(mc, nextStart, to, depth + 1);
+        }
+
+        // nếu block thật sự cản
+        if (hitDist <= NEAR_BLOCK_DISTANCE) return false;
+
+        Vec3d dir = to.subtract(from).normalize();
+        Vec3d nextStart = hitVec.add(dir.multiply(STEP_OUT_BLOCK));
+        if (nextStart.distanceTo(to) < 1e-6) return true;
+
+        return raycastVisible(mc, nextStart, to, depth + 1);
+    }
+
+    // --- Skip transparent blocks ---
+    @Unique
+    private boolean isCullableBlock(BlockState state) { try { if (!state.isOpaqueFullCube()) return false; } catch (Exception ignored) {} try { BlockRenderLayer layer = RenderLayers.getBlockLayer(state); return !(layer == BlockRenderLayer.CUTOUT || layer == BlockRenderLayer.CUTOUT_MIPPED || layer == BlockRenderLayer.TRANSLUCENT); } catch (Exception ignored) { return true; } }
+    // --- Reflection fallback ---
+    @Unique
+    @SuppressWarnings("unchecked")
+    private T extractEntityFromState(LivingEntityRenderState state) {
+        if (state == null) return null;
+        String[] getters = {"getLivingEntity", "getEntity", "getOwner", "getRenderedEntity"};
+        for (String g : getters) try {
+            Method m = state.getClass().getMethod(g);
+            m.setAccessible(true);
+            Object o = m.invoke(state);
+            if (o instanceof LivingEntity e) return (T) e;
+        } catch (Exception ignored) {}
+
+        for (Field f : state.getClass().getDeclaredFields()) try {
+            f.setAccessible(true);
+            Object o = f.get(state);
+            if (o instanceof LivingEntity e) return (T) e;
+        } catch (Exception ignored) {}
+        return null;
+    }
+}
+*/
+--------------------------------------------------
+package yt.Numpamc.frustumcullingentity.mixin;
+
+import net.minecraft.block.BlockState;
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.render.BlockRenderLayer;
+import net.minecraft.client.render.Camera;
+import net.minecraft.client.render.RenderLayers;
+import net.minecraft.client.render.VertexConsumerProvider;
+import net.minecraft.client.render.entity.LivingEntityRenderer;
+import net.minecraft.client.render.entity.state.LivingEntityRenderState;
+import net.minecraft.client.util.math.MatrixStack;
+import net.minecraft.entity.LivingEntity;
+import net.minecraft.util.hit.BlockHitResult;
+import net.minecraft.util.hit.HitResult;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Box;
+import net.minecraft.util.math.Vec3d;
+import net.minecraft.world.RaycastContext;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Unique;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+import yt.Numpamc.com.NumpaMC.CacheEntry;
+
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.util.Map;
+import java.util.WeakHashMap;
+
+@Mixin(LivingEntityRenderer.class)
+public abstract class LivingEntityRendererMixin<T extends LivingEntity> {
+    @Unique private static final double MAX_RENDER_DISTANCE = 110.0;
+    @Unique private static final long CACHE_DURATION_MS = 250L;
+    @Unique private static final int MAX_RECURSION_DEPTH = 8;
+    @Unique private static final double STEP_OUT_BLOCK = 0.1;
+    @Unique private static final double NEAR_BLOCK_DISTANCE = 100.0; // khoảng cách dưới đó coi là bị che (cũng ổn hơn 100)
+
+    // Cache: entity -> (visible, lastUpdateTime)
+    @Unique
+    private final Map<T, CacheEntry> visibilityCache = new WeakHashMap<>();
+
+    // Map state -> entity để từ render(state) có thể tra ngược entity (updateRenderState sẽ gán)
+    @Unique
+    private final Map<LivingEntityRenderState, T> stateToEntity = new WeakHashMap<>();
+
+    /**
+     * Hook updateRenderState để có access tới LivingEntity (và cập nhật cache).
+     * Signature: updateRenderState(T livingEntity, S livingEntityRenderState, float f)
+     */
+    @Inject(method = "updateRenderState*", at = @At("HEAD"))
+    private void onUpdateRenderState(T livingEntity, LivingEntityRenderState state, float tickDelta, CallbackInfo ci) {
+        if (livingEntity == null) return;
+
+        // Lưu mapping state -> entity để render(...) có thể lookup
+        stateToEntity.put(state, livingEntity);
+
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client == null || client.gameRenderer == null || client.world == null) return;
+
+        Camera camera = client.gameRenderer.getCamera();
+        Vec3d camPos = camera.getPos();
+
+        Box entityBox = livingEntity.getBoundingBox();
+        Vec3d entityCenter = entityBox.getCenter();
+        double distSq = camPos.squaredDistanceTo(entityCenter);
+        if (distSq > MAX_RENDER_DISTANCE * MAX_RENDER_DISTANCE) {
+            visibilityCache.put(livingEntity, new CacheEntry(false, System.currentTimeMillis()));
+            return;
+        }
+
+        // Cache short-circuit
+        CacheEntry cached = visibilityCache.get(livingEntity);
+        long now = System.currentTimeMillis();
+        if (cached != null && (now - cached.lastCheck < CACHE_DURATION_MS)) {
+            // keep cached value as-is
+            return;
+        }
+
+        // Full visibility test (raycasts)
+        boolean visible = computeVisibility(client, camPos, entityBox, entityCenter);
+
+        visibilityCache.put(livingEntity, new CacheEntry(visible, now));
+    }
+
+    /**
+     * Hook render(state, ...) và cancel nếu cache bảo invisible.
+     */
+    @Inject(method = "render*", at = @At("HEAD"), cancellable = true)
+    private void preRender(LivingEntityRenderState state,
+                           MatrixStack matrices,
+                           VertexConsumerProvider vertexConsumers,
+                           int light,
+                           CallbackInfo ci) {
+
+        // Lookup entity from state
+        T entity = stateToEntity.get(state);
+        if (entity == null) {
+            // As fallback: try to extract via reflection (very rare)
+            entity = extractEntityFromState(state);
+            if (entity == null) return;
+        }
+
+        T key = entity;
+        CacheEntry cached = visibilityCache.get(key);
+        long now = System.currentTimeMillis();
+        if (cached != null && (now - cached.lastCheck < CACHE_DURATION_MS)) {
+            if (!cached.visible) {
+                ci.cancel();
+            }
+            return;
+        }
+
+        // If not cached (rare, maybe updateRenderState not called), do quick check now
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client == null || client.gameRenderer == null || client.world == null) return;
+
+        Camera camera = client.gameRenderer.getCamera();
+        Vec3d camPos = camera.getPos();
+        Box box = entity.getBoundingBox();
+        Vec3d center = box.getCenter();
+        double distSq = camPos.squaredDistanceTo(center);
+        if (distSq > MAX_RENDER_DISTANCE * MAX_RENDER_DISTANCE) {
+            visibilityCache.put(key, new CacheEntry(false, now));
+            ci.cancel();
+            return;
+        }
+
+        boolean visible = computeVisibility(client, camPos, box, center);
+        visibilityCache.put(key, new CacheEntry(visible, now));
+        if (!visible) ci.cancel();
+    }
+
+    // --- visibility helpers ---
+
+    @Unique
+    private boolean computeVisibility(MinecraftClient client, Vec3d cameraPos, Box entityBox, Vec3d entityCenter) {
+        if (client == null || client.world == null) return true; // an toàn: không cull nếu không có world
+
+        // Sample points: center + 8 corners (độ phủ tốt hơn)
+        Vec3d center = entityCenter;
+        Vec3d[] corners = new Vec3d[] {
+                new Vec3d(entityBox.minX, entityBox.minY, entityBox.minZ),
+                new Vec3d(entityBox.maxX, entityBox.maxY, entityBox.maxZ),
+
+        };
+
+        // Thử center trước (thường nhanh)
+        if (raycastVisible(client, cameraPos, center, 0)) return true;
+
+        // Thử các góc
+        for (Vec3d target : corners) {
+            if (raycastVisible(client, cameraPos, target, 0)) return true;
+        }
+
+        // Nếu tất cả ray đều bị block (sau recursion), coi như invisible
+        return false;
+    }
+
+    /**
+     * Raycast có recursion: nếu chạm block nhưng block được coi là "không che" (glass, leaves, cutout...), sẽ "bước qua"
+     * và tiếp tục raycast từ điểm vừa chạm đi tiếp về target. depth giới hạn để tránh infinite recursion.
+     */
+    @Unique
+    private boolean raycastVisible(MinecraftClient mc, Vec3d from, Vec3d to, int depth) {
+        // Giới hạn đệ quy + kiểm tra null an toàn
+        if (depth > MAX_RECURSION_DEPTH || mc == null || mc.world == null) return false;
+
+        // Raycast với OUTLINE để phát hiện block mỏng / cutout chính xác
+        RaycastContext ctx = new RaycastContext(
+                from, to,
+                RaycastContext.ShapeType.OUTLINE,
+                RaycastContext.FluidHandling.NONE,
+                mc.player
+        );
+
+        HitResult result = mc.world.raycast(ctx);
+
+        // Không có va chạm → không bị block chắn
+        if (result == null) return true;
+
+        // Nếu không phải block (miss hoặc entity) → thấy được
+        if (result.getType() != HitResult.Type.BLOCK) return true;
+
+        // Ép kiểu an toàn
+        Vec3d hitVec;
+        BlockPos pos;
+        try {
+            BlockHitResult bhr = (BlockHitResult) result;
+            hitVec = bhr.getPos();
+            pos = bhr.getBlockPos();
+        } catch (Exception e) {
+            hitVec = result.getPos();
+            pos = new BlockPos(
+                    (int) Math.floor(hitVec.x),
+                    (int) Math.floor(hitVec.y),
+                    (int) Math.floor(hitVec.z)
+            );
+        }
+
+        double hitDist = from.distanceTo(hitVec);
+        BlockState hitState = mc.world.getBlockState(pos);
+
+        // Kiểm tra block có che tầm nhìn hay không
+        boolean isBlocking;
+        try {
+            // true nếu block thật sự đặc, opaque, che tầm nhìn
+            isBlocking = isCullableBlock(mc, hitState);
+        } catch (Exception ignored) {
+            // fallback an toàn: coi là có che để tránh raycast vô hạn
+            isBlocking = true;
+        }
+
+        // Nếu block trong suốt / không che → raycast xuyên qua
+        if (!isBlocking) {
+            Vec3d dir = to.subtract(from);
+            double len = dir.length();
+            if (len == 0) return false;
+
+            Vec3d ndir = dir.normalize();
+            Vec3d nextStart = hitVec.add(ndir.multiply(STEP_OUT_BLOCK));
+
+            // Nếu điểm kế quá gần target → coi như thấy được
+            if (nextStart.distanceTo(to) < 1e-6) return true;
+
+            // Raycast tiếp sâu hơn (đệ quy)
+            return raycastVisible(mc, nextStart, to, depth + 1);
+        }
+
+        // Nếu block đặc → entity bị che
+        // Kiểm tra khoảng cách để tránh lỗi flick khi sát block
+        if (hitDist <= NEAR_BLOCK_DISTANCE) return false;
+
+        // Block đặc và ở xa → vẫn bị chắn (bảo thủ)
+        return false;
+    }
+
+
+    /**
+     * Kiểm tra block có thể che khuất (opaque, non-translucent)
+     */
+    @Unique
+    private boolean isCullableBlock(MinecraftClient client, BlockState state) {
+        // Nếu block không phải full opaque cube → không che
+        try {
+            if (!state.isOpaque()) {
+                return false;
+            }
+        } catch (Exception ignored) {
+            // fallback conservative: nếu không chắc, coi là không che (để tránh cull nhầm)
+            return false;
+        }
+
+        // Kiểm tra RenderLayer theo mapping 1.21.x (RenderLayers.getBlockLayer returns RenderLayer)
+        try {
+            BlockRenderLayer layer = RenderLayers.getBlockLayer(state);
+            return !(layer == BlockRenderLayer.CUTOUT
+                    || layer == BlockRenderLayer.CUTOUT_MIPPED
+                    || layer == BlockRenderLayer.TRIPWIRE
+                    || layer == BlockRenderLayer.TRANSLUCENT);
+
+        } catch (Exception ignored) {
+            // fallback: nếu gặp lỗi, coi như che
+            return true;
+        }
+    }
+
+    /**
+     * Nếu updateRenderState mapping khác, không có getter entity — fallback reflect (hiếm).
+     */
+    @Unique
+    @SuppressWarnings("unchecked")
+    private T extractEntityFromState(LivingEntityRenderState state) {
+        if (state == null) return null;
+
+        // thử getter names (thường không có)
+        String[] getterNames = new String[] { "getLivingEntity", "getEntity", "getOwner", "getRenderedEntity" };
+        for (String g : getterNames) {
+            try {
+                Method m = state.getClass().getMethod(g);
+                m.setAccessible(true);
+                Object o = m.invoke(state);
+                if (o instanceof LivingEntity) return (T) o;
+            } catch (Exception ignored) {
+            }
+        }
+
+        // thử các field names
+        String[] fieldNames = new String[] { "livingEntity", "entity", "owner", "renderedEntity" };
+        for (String fName : fieldNames) {
+            try {
+                Field f = state.getClass().getDeclaredField(fName);
+                f.setAccessible(true);
+                Object o = f.get(state);
+                if (o instanceof LivingEntity) return (T) o;
+            } catch (Exception ignored) {
+            }
+        }
+
+        // thử scan tất cả fields
+        try {
+            for (Field f : state.getClass().getDeclaredFields()) {
+                f.setAccessible(true);
+                Object o = f.get(state);
+                if (o instanceof LivingEntity) return (T) o;
+            }
+        } catch (Exception ignored) {}
+
+        return null;
+    }
+
+}

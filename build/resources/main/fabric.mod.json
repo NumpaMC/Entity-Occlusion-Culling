@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "id": "frustum_culling",
+  "version": "1.0-SNAPSHOT",
+  "name": "Frustum Culling Entity",
+  "description": "Optimizes entity rendering using aggressive frustum culling for better FPS.",
+  "authors": [
+    "NumpaMC"
+  ],
+  "contact": {
+    "homepage": "https://youtube.com/@NumpaMC",
+    "sources": "https://github.com/NumpaMC"
+  },
+  "license": "GPL-3.0 license",
+  "icon": "assets/icon.png",
+  "environment": "*",
+  "entrypoints": {
+    "client": [
+      "com.NumpaMC.client.FrustumCullingMod"
+    ]
+  },
+  "mixins": [
+    "frustum_culling_fabric.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "minecraft": "~1.21.11",
+    "java": ">=21"
+  }
+}

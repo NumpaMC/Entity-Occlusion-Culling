@@ -1,0 +1,2 @@
+/fill 17 -61 -1
+/fill 17 -61 -1 ~ ~ ~ minecraft:blue_shulker_box

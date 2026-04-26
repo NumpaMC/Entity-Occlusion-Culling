@@ -1,0 +1,210 @@
+package yt.Numpamc.frustumcullingentity.mixin;
+
+import net.minecraft.block.BlockState;
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.render.*;
+import net.minecraft.client.render.command.OrderedRenderCommandQueue;
+import net.minecraft.client.render.entity.LivingEntityRenderer;
+import net.minecraft.client.render.entity.state.LivingEntityRenderState;
+import net.minecraft.client.render.state.CameraRenderState;
+import net.minecraft.client.util.math.MatrixStack;
+import net.minecraft.entity.LivingEntity;
+import net.minecraft.util.hit.BlockHitResult;
+import net.minecraft.util.hit.HitResult;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Box;
+import net.minecraft.util.math.Vec3d;
+import net.minecraft.world.RaycastContext;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Unique;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+import yt.Numpamc.com.NumpaMC.CacheEntry;
+
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.util.Map;
+import java.util.WeakHashMap;
+
+@Mixin(LivingEntityRenderer.class)
+public abstract class LivingEntityRendererMixin<T extends LivingEntity> {
+
+    @Unique
+    private static final double MAX_RENDER_DISTANCE = 110.0;
+    @Unique private static final double NEAR_BLOCK_DISTANCE = 100.0; // từ bản gốc
+    @Unique private static final long CACHE_DURATION_MS = 250L;
+
+    @Unique private final Map<T, CacheEntry> visibilityCache = new WeakHashMap<>();
+    @Unique private final Map<LivingEntityRenderState, T> stateToEntity = new WeakHashMap<>();
+
+    @Inject(method = "updateRenderState*", at = @At("HEAD"))
+    private void onUpdateRenderState(T livingEntity, LivingEntityRenderState state, float tickDelta, CallbackInfo ci) {
+        if (livingEntity == null) return;
+
+        stateToEntity.put(state, (T) livingEntity);
+
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client == null || client.gameRenderer == null || client.world == null) return;
+
+        Camera camera = client.gameRenderer.getCamera();
+        Vec3d camPos = camera.getPos();
+
+        Box entityBox = livingEntity.getBoundingBox();
+        Vec3d entityCenter = entityBox.getCenter();
+        double distSq = camPos.squaredDistanceTo(entityCenter);
+        if (distSq > MAX_RENDER_DISTANCE * MAX_RENDER_DISTANCE) {
+            visibilityCache.put((T) livingEntity, new CacheEntry(false, System.currentTimeMillis()));
+            return;
+        }
+
+        CacheEntry cached = visibilityCache.get((T) livingEntity);
+        long now = System.currentTimeMillis();
+        if (cached != null && (now - cached.lastCheck < CACHE_DURATION_MS)) {
+            return;
+        }
+
+        boolean visible = computeVisibility(client, camPos, entityBox, entityCenter, livingEntity);
+        visibilityCache.put((T) livingEntity, new CacheEntry(visible, now));
+    }
+
+    @Inject(method = "render*", at = @At("HEAD"), cancellable = true)
+    private void preRender(LivingEntityRenderState state,
+                           MatrixStack matrices,
+                           OrderedRenderCommandQueue queue,
+                           CameraRenderState cameraState,
+                           CallbackInfo ci) {
+
+        T entity = stateToEntity.get(state);
+        if (entity == null) {
+            entity = extractEntityFromState(state);
+            if (entity == null) return;
+        }
+
+        T key = (T) entity;
+        CacheEntry cached = visibilityCache.get(key);
+        long now = System.currentTimeMillis();
+        if (cached != null && (now - cached.lastCheck < CACHE_DURATION_MS)) {
+            if (!cached.visible) ci.cancel();
+            return;
+        }
+
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client == null || client.gameRenderer == null || client.world == null) return;
+
+        Camera camera = client.gameRenderer.getCamera();
+        Vec3d camPos = camera.getPos();
+        Box box = entity.getBoundingBox();
+        Vec3d center = box.getCenter();
+        double distSq = camPos.squaredDistanceTo(center);
+        if (distSq > MAX_RENDER_DISTANCE * MAX_RENDER_DISTANCE) {
+            visibilityCache.put(key, new CacheEntry(false, now));
+            ci.cancel();
+            return;
+        }
+
+        boolean visible = computeVisibility(client, camPos, box, center, entity);
+        visibilityCache.put(key, new CacheEntry(visible, now));
+        if (!visible) ci.cancel();
+    }
+
+    // --- visibility helpers ---
+
+    @Unique
+    private boolean computeVisibility(MinecraftClient client, Vec3d cameraPos, Box entityBox, Vec3d entityCenter, LivingEntity entity) {
+        Vec3d[] points = new Vec3d[]{
+                entityCenter,
+                new Vec3d(entityBox.minX, entityBox.minY, entityBox.minZ),
+                new Vec3d(entityBox.maxX, entityBox.maxY, entityBox.maxZ)
+        };
+
+        for (Vec3d target : points) {
+            assert client.player != null;
+            RaycastContext ctx = new RaycastContext(
+                    cameraPos,
+                    target,
+                    RaycastContext.ShapeType.OUTLINE,
+                    RaycastContext.FluidHandling.NONE,
+                    client.player
+            );
+
+            assert client.world != null;
+            BlockHitResult result = client.world.raycast(ctx);
+            if (result == null || result.getType() != HitResult.Type.BLOCK) {
+                return true; // không bị che chắn
+            }
+
+            BlockPos pos = result.getBlockPos();
+            Vec3d hitVec = result.getPos();
+            double hitDist = cameraPos.distanceTo(hitVec);
+
+            BlockState blockState = client.world.getBlockState(pos);
+
+            // nếu block trong suốt → bỏ qua
+            if (!isCullableBlock(client, pos, blockState)) {
+                return true;
+            }
+
+            // nếu block đặc nhưng quá gần → không cull (fix flick khi sát block)
+            if (hitDist <= NEAR_BLOCK_DISTANCE) {
+                return false;
+            }
+        }
+
+        return false;
+    }
+
+    @Unique
+    private boolean isCullableBlock(MinecraftClient client, BlockPos pos, BlockState state) {
+        try {
+            if (!state.isOpaqueFullCube()) return false;
+        } catch (Exception ignored) {
+            return false;
+        }
+
+        try {
+            BlockRenderLayer layer = RenderLayers.getBlockLayer(state);
+            return !(layer == BlockRenderLayer.CUTOUT
+                    || layer == BlockRenderLayer.CUTOUT_MIPPED
+                    || layer == BlockRenderLayer.TRANSLUCENT);
+        } catch (Exception ignored) {
+            return true;
+        }
+    }
+
+    @Unique
+    @SuppressWarnings("unchecked")
+    private T extractEntityFromState(LivingEntityRenderState state) {
+        if (state == null) return null;
+
+        String[] getterNames = { "getLivingEntity", "getEntity", "getOwner", "getRenderedEntity" };
+        for (String g : getterNames) {
+            try {
+                Method m = state.getClass().getMethod(g);
+                m.setAccessible(true);
+                Object o = m.invoke(state);
+                if (o instanceof LivingEntity) return (T) o;
+            } catch (Exception ignored) {}
+        }
+
+        String[] fieldNames = { "livingEntity", "entity", "owner", "renderedEntity" };
+        for (String fName : fieldNames) {
+            try {
+                Field f = state.getClass().getDeclaredField(fName);
+                f.setAccessible(true);
+                Object o = f.get(state);
+                if (o instanceof LivingEntity) return (T) o;
+            } catch (Exception ignored) {}
+        }
+
+        try {
+            for (Field f : state.getClass().getDeclaredFields()) {
+                f.setAccessible(true);
+                Object o = f.get(state);
+                if (o instanceof LivingEntity) return (T) o;
+            }
+        } catch (Exception ignored) {}
+
+        return null;
+    }
+}
